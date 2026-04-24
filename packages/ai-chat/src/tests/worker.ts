@@ -7,7 +7,8 @@ import {
 import type {
   UIMessage as ChatMessage,
   StreamTextOnFinishCallback,
-  ToolSet
+  ToolSet,
+  UIMessageChunk
 } from "ai";
 import { getCurrentAgent, routeAgentRequest } from "agents";
 import { MessageType, type OutgoingMessage } from "../types";
@@ -66,6 +67,7 @@ export type Env = {
   NonChatRecoveryTestAgent: DurableObjectNamespace<NonChatRecoveryTestAgent>;
   RecoveryThrowingAgent: DurableObjectNamespace<RecoveryThrowingAgent>;
   RecoverySlowStreamAgent: DurableObjectNamespace<RecoverySlowStreamAgent>;
+  ClientOutputFilterAgent: DurableObjectNamespace<ClientOutputFilterAgent>;
 };
 
 export class TestChatAgent extends AIChatAgent<Env> {
@@ -1507,6 +1509,56 @@ export class RecoverySlowStreamAgent extends SlowStreamAgent {
         SELECT id, name FROM cf_agents_runs
       ` || []
     );
+  }
+}
+
+export class ClientOutputFilterAgent extends AIChatAgent<Env> {
+  async onChatMessage(): Promise<Response> {
+    return makeSSEChunkResponse([
+      { type: "start", messageId: "filtered-client-output-response" },
+      { type: "reasoning-start", id: "reasoning-1" },
+      {
+        type: "reasoning-delta",
+        id: "reasoning-1",
+        delta: "private reasoning"
+      },
+      { type: "reasoning-end", id: "reasoning-1" },
+      {
+        type: "data-internal",
+        id: "internal-1",
+        data: { note: "hidden from clients" }
+      },
+      { type: "text-start", id: "text-1" },
+      { type: "text-delta", id: "text-1", delta: "Visible answer." },
+      { type: "text-end", id: "text-1" },
+      { type: "finish" }
+    ]);
+  }
+
+  protected filterMessageStreamChunkForClient(chunk: UIMessageChunk): boolean {
+    return (
+      chunk.type !== "reasoning-start" &&
+      chunk.type !== "reasoning-delta" &&
+      chunk.type !== "reasoning-end" &&
+      chunk.type !== "data-internal"
+    );
+  }
+
+  protected filterMessagePartForClient(
+    part: ChatMessage["parts"][number]
+  ): boolean {
+    return part.type !== "reasoning" && part.type !== "data-internal";
+  }
+
+  getPersistedMessages(): ChatMessage[] {
+    return (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => JSON.parse(row.message as string));
+  }
+
+  async waitForIdleForTest(): Promise<void> {
+    await (this as unknown as { waitForIdle(): Promise<void> }).waitForIdle();
   }
 }
 
