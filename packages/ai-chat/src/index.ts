@@ -21,6 +21,12 @@ import {
   type OutgoingMessage
 } from "./types";
 import { autoTransformMessages } from "./ai-chat-v5-migration";
+import {
+  filterMessagesForClient,
+  filterOutgoingMessageForClient,
+  type MessagePartClientFilterContext,
+  type StreamChunkClientFilterContext
+} from "./client-output-filters";
 import { reconcileMessages, resolveToolMergeId } from "./message-reconciler";
 import {
   applyChunkToParts,
@@ -894,7 +900,9 @@ export class AIChatAgent<
       return this._tryCatchChat(async () => {
         const url = new URL(request.url);
         if (url.pathname.split("/").pop() === "get-messages") {
-          return Response.json(this._loadMessagesFromDb());
+          return Response.json(
+            this._filterMessagesForClient(this._loadMessagesFromDb())
+          );
         }
         return _onRequest(request);
       });
@@ -1188,7 +1196,26 @@ export class AIChatAgent<
       ...(exclude || []),
       ...this._pendingResumeConnections
     ];
-    this.broadcast(JSON.stringify(message), allExclusions);
+    this.broadcast(
+      JSON.stringify(this._filterOutgoingMessageForClient(message)),
+      allExclusions
+    );
+  }
+
+  private _filterMessagesForClient(
+    messages: readonly UIMessage[]
+  ): readonly UIMessage[] {
+    return filterMessagesForClient(messages, (part, context) =>
+      this.filterMessagePartForClient(part, context)
+    );
+  }
+
+  private _filterOutgoingMessageForClient(
+    message: OutgoingMessage
+  ): OutgoingMessage {
+    return filterOutgoingMessageForClient(message, (part, context) =>
+      this.filterMessagePartForClient(part, context)
+    );
   }
 
   /**
@@ -1207,6 +1234,21 @@ export class AIChatAgent<
       | { type: "text-end"; id: string },
     continuation: boolean
   ) {
+    if (
+      !this.filterMessageStreamChunkForClient(event, {
+        requestId: event.id,
+        streamId,
+        message: this._streamingMessage ?? {
+          id: event.id,
+          role: "assistant",
+          parts: []
+        },
+        continuation
+      })
+    ) {
+      return;
+    }
+
     const body = JSON.stringify(event);
     this._storeStreamChunk(streamId, body);
     this._broadcastChatMessage({
@@ -1540,22 +1582,22 @@ export class AIChatAgent<
 
   private _messagesForClientSync(): readonly UIMessage[] {
     if (!this._streamingMessage || this._streamingMessage.parts.length === 0) {
-      return this.messages;
+      return this._filterMessagesForClient(this.messages);
     }
 
     const existingIdx = this.messages.findIndex(
       (message) => message.id === this._streamingMessage?.id
     );
+    const messages =
+      existingIdx >= 0
+        ? this.messages.map((message, idx) =>
+            idx === existingIdx && this._streamingMessage
+              ? this._streamingMessage
+              : message
+          )
+        : [...this.messages, this._streamingMessage];
 
-    if (existingIdx >= 0) {
-      return this.messages.map((message, idx) =>
-        idx === existingIdx && this._streamingMessage
-          ? this._streamingMessage
-          : message
-      );
-    }
-
-    return [...this.messages, this._streamingMessage];
+    return this._filterMessagesForClient(messages);
   }
 
   private _sendDirectMessage(
@@ -1563,7 +1605,9 @@ export class AIChatAgent<
     message: OutgoingMessage
   ): void {
     try {
-      connection.send(JSON.stringify(message));
+      connection.send(
+        JSON.stringify(this._filterOutgoingMessageForClient(message))
+      );
     } catch {
       // Connection closed before the server could reply.
     }
@@ -2086,6 +2130,25 @@ export class AIChatAgent<
     message: UIMessage
   ): UIMessage {
     return message;
+  }
+
+  /** Return false to hide persisted message parts from client outputs. */
+  protected filterMessagePartForClient(
+    _part: UIMessage["parts"][number],
+    _context: MessagePartClientFilterContext
+  ): boolean {
+    return true;
+  }
+
+  /**
+   * Return false to hide stream chunks from client broadcasts and replay.
+   * The server still applies each chunk to the persisted assistant message.
+   */
+  protected filterMessageStreamChunkForClient(
+    _chunk: UIMessageChunk,
+    _context: StreamChunkClientFilterContext
+  ): boolean {
+    return true;
   }
 
   /**
@@ -3207,16 +3270,6 @@ export class AIChatAgent<
                   // No-op for message building (shared parser handles step-start)
                   break;
                 }
-                case "error": {
-                  this._broadcastChatMessage({
-                    error: true,
-                    body: data.errorText ?? JSON.stringify(data),
-                    done: false,
-                    id,
-                    type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
-                  });
-                  break;
-                }
               }
             }
 
@@ -3243,6 +3296,27 @@ export class AIChatAgent<
                 type: "finish",
                 messageMetadata: { finishReason }
               };
+            }
+
+            if (
+              !this.filterMessageStreamChunkForClient(data, {
+                requestId: id,
+                streamId,
+                message,
+                continuation
+              })
+            ) {
+              continue;
+            }
+
+            if (data.type === "error") {
+              this._broadcastChatMessage({
+                error: true,
+                body: data.errorText ?? JSON.stringify(data),
+                done: false,
+                id,
+                type: MessageType.CF_AGENT_USE_CHAT_RESPONSE
+              });
             }
 
             // Store chunk for replay and broadcast to clients

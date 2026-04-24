@@ -99,6 +99,10 @@
       {
         "class_name": "RecoverySlowStreamAgent",
         "name": "RecoverySlowStreamAgent"
+      },
+      {
+        "class_name": "ClientOutputFilterAgent",
+        "name": "ClientOutputFilterAgent"
       }
     ]
   },
@@ -169,6 +173,10 @@
     {
       "new_sqlite_classes": ["RecoveryThrowingAgent"],
       "tag": "v12"
+    },
+    {
+      "new_sqlite_classes": ["ClientOutputFilterAgent"],
+      "tag": "v13"
     }
   ]
 }
